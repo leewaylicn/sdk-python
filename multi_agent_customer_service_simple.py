@@ -9,10 +9,11 @@
 4. Transfer UtilityAgent - 人工转接流程 [使用工具]
 5. Answer Agent (LLM) - 最终回答 [纯PE]
 
-基于stateful_graph.py的优雅实现：
+基于stateful_graph_design.py的优雅实现（继承模式）：
 - 极简的UnifiedAgentState（只有状态字段映射）
 - StateManager负责状态验证和处理
-- StatefulGraph支持条件路由和fallback机制
+- StatefulGraph支持真正的状态感知条件路由和fallback机制
+- 实时状态处理：在节点执行时立即处理状态
 """
 
 import time
@@ -24,7 +25,7 @@ from strands import Agent, tool
 
 # Local imports
 from utility_agent_standalone import create_utility_agent
-from stateful_graph import StatefulGraphBuilder
+from stateful_graph import StatefulGraphBuilder, StateManager
 
 class UnifiedAgentState:
     """统一的Agent状态字段定义 - 极简设计，只有状态字段映射
@@ -262,18 +263,36 @@ class MultiAgentCustomerService:
         # 添加边和条件路由
         builder.add_edge(entry_node, route_node)
         
-        # 简化的条件路由（由于GraphBuilder限制，使用简单的条件函数）
-        def needs_human_intervention(state):
-            """检查是否需要人工干预 - 简化版本"""
-            # 这里无法访问StatefulGraph的state_manager，使用简化逻辑
-            return False  # 暂时总是返回False，让所有请求都走自动处理
+        # 真正的状态感知条件路由 - 使用继承模式的优势
+        def needs_human_intervention(state_manager: StateManager) -> bool:
+            """检查是否需要人工干预 - 真正的状态感知版本"""
+            requires_human = state_manager.get_state("requires_human")
+            stage = state_manager.get_state("stage")
+            status = state_manager.get_state("status")
+            
+            print(f"     🤔 人工干预检查: requires_human={requires_human}, stage={stage}, status={status}")
+            
+            # 只有当route_agent成功执行且明确需要人工干预时才转接
+            return (stage == "route_agent" and 
+                    status == "Success" and 
+                    requires_human == True)
         
-        def needs_auto_processing(state):
-            """检查是否需要自动处理 - 简化版本"""
-            return True  # 暂时总是返回True
+        def needs_auto_processing(state_manager: StateManager) -> bool:
+            """检查是否需要自动处理 - 真正的状态感知版本"""
+            requires_human = state_manager.get_state("requires_human")
+            stage = state_manager.get_state("stage")
+            status = state_manager.get_state("status")
+            
+            print(f"     🤖 自动处理检查: requires_human={requires_human}, stage={stage}, status={status}")
+            
+            # 只有当route_agent成功执行且不需要人工干预时才自动处理
+            return (stage == "route_agent" and 
+                    status == "Success" and 
+                    requires_human == False)
         
-        builder.add_edge(route_node, transfer_node, condition=needs_human_intervention)
-        builder.add_edge(route_node, intent_node, condition=needs_auto_processing)
+        # 使用真正的状态感知条件边
+        builder.add_state_aware_edge(route_node, transfer_node, needs_human_intervention)
+        builder.add_state_aware_edge(route_node, intent_node, needs_auto_processing)
         builder.add_edge(intent_node, answer_node)
         
         # 设置入口点
@@ -320,13 +339,14 @@ class MultiAgentCustomerService:
 
 def main():
     """主程序"""
-    print("🎯 多Agent客户服务系统演示 - 基于StatefulGraph的简化版本")
+    print("🎯 多Agent客户服务系统演示 - 基于StatefulGraph的继承模式版本")
     print("="*60)
     print("💡 设计特点：")
     print("  - 极简的UnifiedAgentState（只有状态字段映射）")
     print("  - StateManager负责状态验证和处理")
-    print("  - StatefulGraph支持条件路由和fallback机制")
-    print("  - 后处理模式：Graph执行完成后提取状态")
+    print("  - StatefulGraph支持真正的状态感知条件路由和fallback机制")
+    print("  - 实时状态处理：在节点执行时立即处理状态")
+    print("  - 状态感知条件边：条件函数可以访问最新的Agent输出状态")
     print("="*60)
     
     # 测试用例 - 简化版本
@@ -363,8 +383,9 @@ def main():
     print("\n💡 系统特性验证:")
     print("  ✅ 极简UnifiedAgentState - 只有状态字段映射")
     print("  ✅ StateManager状态管理 - 验证、标准化、处理")
-    print("  ✅ StatefulGraph后处理 - 执行完成后提取状态")
-    print("  ✅ 条件路由支持 - 基于状态的路由决策")
+    print("  ✅ StatefulGraph实时状态处理 - 在节点执行时立即处理状态")
+    print("  ✅ 真正的状态感知条件路由 - 条件函数可以访问最新状态")
+    print("  ✅ 状态注入机制 - 执行前将全局状态注入到Agent")
     print("  ✅ Fallback机制 - 状态提取失败时的兜底方案")
 
 
