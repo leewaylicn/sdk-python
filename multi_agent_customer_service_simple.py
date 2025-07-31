@@ -468,11 +468,20 @@ class MultiAgentCustomerService:
             user_input_data = state_manager.get_state("service_selector_user_input")
             if user_input_data:
                 user_selection = user_input_data.get("input")
-                print(f"     ✅ 发现服务类型选择: {user_selection}")
+                original_output = user_input_data.get("original_output", {})
+                options = original_output.get("options", [])
                 
-                # 将用户选择的服务类型传递给priority_confirmer工具
-                # 通过更新全局状态来传递参数
-                state_manager.global_state["selected_service_type"] = user_selection
+                # 将数字选择转换为实际的服务类型名称
+                actual_service_type = user_selection
+                if user_selection.isdigit() and options:
+                    choice_index = int(user_selection) - 1
+                    if 0 <= choice_index < len(options):
+                        actual_service_type = options[choice_index]
+                
+                print(f"     ✅ 发现服务类型选择: {user_selection} -> {actual_service_type}")
+                
+                # 将实际的服务类型名称传递给priority_confirmer工具
+                state_manager.global_state["selected_service_type"] = actual_service_type
                 return True
             print(f"     ❌ 未发现服务类型选择")
             return False
@@ -492,8 +501,8 @@ class MultiAgentCustomerService:
                 return False
                 
             user_confirmation = user_input_data.get("input")
-            service_input = state_manager.get_state("service_selector_user_input")
-            service_type = service_input.get("input", "") if service_input else ""
+            # 使用转换后的服务类型名称
+            service_type = state_manager.global_state.get("selected_service_type", "")
             
             # 解析用户选择的优先级
             if "高优先级" in user_confirmation or "确认" in user_confirmation:
@@ -531,8 +540,8 @@ class MultiAgentCustomerService:
                 return False
                 
             user_confirmation = user_input_data.get("input")
-            service_input = state_manager.get_state("service_selector_user_input")
-            service_type = service_input.get("input", "") if service_input else ""
+            # 使用转换后的服务类型名称
+            service_type = state_manager.global_state.get("selected_service_type", "")
             
             user_priority_level = state_manager.global_state.get("user_priority_level")
             
@@ -643,6 +652,14 @@ class MultiAgentCustomerService:
         """处理用户交互请求 - 等待终端输入并继续执行"""
         node_id = interaction_request.get("node_id")
         original_output = interaction_request.get("original_output", {})
+        
+        # 尝试从状态管理器中获取最新的Agent输出
+        if not original_output and hasattr(self.graph, 'state_manager'):
+            agent_result_key = f"{node_id}_result"
+            agent_result = self.graph.state_manager.get_state(agent_result_key)
+            if agent_result and isinstance(agent_result, dict):
+                original_output = agent_result
+        
         options = original_output.get("options", [])
         message = original_output.get("message", "请选择一个选项：")
         
