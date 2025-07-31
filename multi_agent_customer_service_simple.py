@@ -25,7 +25,7 @@ from strands import Agent, tool
 
 # Local imports
 from utility_agent_standalone import create_utility_agent
-from stateful_graph import StatefulGraphBuilder, StateManager
+from stateful_graph import StatefulGraphBuilder, StateManager, UserInteractionRequiredException
 
 class UnifiedAgentState:
     """统一的Agent状态字段定义 - 极简设计，只有状态字段映射
@@ -67,39 +67,63 @@ class UnifiedAgentState:
 def analyze_event_type(user_input: str) -> str:
     """分析用户输入的事件类型，区分点击流还是自由文本"""
     
+    # 强制点击事件的关键词（单独出现时必须识别为点击）
+    force_click_keywords = [
+        "帮助", "退款", "投诉", "查询", "联系客服", "人工客服",
+        "help", "refund", "complaint", "query", "contact"
+    ]
+    
     # 点击流的特征
     click_patterns = [
         "点击", "选择", "按钮", "菜单", "选项",
-        "预订", "查看订单", "联系客服", "帮助",
-        "booking", "order", "help", "contact"
+        "预订", "查看订单", "联系客服", "帮助", "退款", "投诉",
+        "查询订单", "订单状态", "客服", "人工", "转人工",
+        "booking", "order", "help", "contact", "refund", "complaint"
     ]
     
     # 自由文本的特征
     chat_patterns = [
         "我想", "请问", "怎么", "为什么", "什么时候",
-        "帮我", "能否", "可以", "希望", "需要"
+        "帮我", "能否", "可以", "希望", "需要", "请告诉我",
+        "我需要了解", "想知道", "有什么", "推荐"
     ]
     
-    # 分析输入长度
+    # 分析输入长度和内容
     input_length = len(user_input)
+    user_input_lower = user_input.lower().strip()
+    
+    # 检查是否是强制点击关键词
+    is_force_click = any(keyword in user_input_lower for keyword in force_click_keywords)
     
     # 计算匹配分数
-    click_score = sum(1 for pattern in click_patterns if pattern in user_input.lower())
-    chat_score = sum(1 for pattern in chat_patterns if pattern in user_input.lower())
+    click_score = sum(1 for pattern in click_patterns if pattern in user_input_lower)
+    chat_score = sum(1 for pattern in chat_patterns if pattern in user_input_lower)
     
-    # 决策逻辑
-    if input_length < 10 and click_score > 0:
+    # 决策逻辑（优化后）
+    if is_force_click and input_length <= 15:
+        # 强制点击关键词且长度较短，必须识别为点击
+        event_type = "click"
+        confidence = 0.9
+    elif input_length < 8 and click_score > 0:
+        # 极短输入且有点击特征
         event_type = "click"
         confidence = 0.8 + min(click_score * 0.1, 0.2)
-    elif input_length > 20 and chat_score > click_score:
+    elif input_length > 25 and chat_score > click_score:
+        # 长文本且聊天特征明显
         event_type = "chat"
         confidence = 0.7 + min(chat_score * 0.1, 0.3)
-    elif click_score > chat_score:
+    elif click_score > chat_score and click_score > 0:
+        # 点击特征更明显
         event_type = "click"
-        confidence = 0.6 + min(click_score * 0.1, 0.3)
-    else:
+        confidence = 0.7 + min(click_score * 0.1, 0.3)
+    elif chat_score > 0:
+        # 有聊天特征
         event_type = "chat"
         confidence = 0.6 + min(chat_score * 0.1, 0.3)
+    else:
+        # 默认为聊天
+        event_type = "chat"
+        confidence = 0.5
     
     result = {
         "event_type": event_type,
@@ -312,16 +336,19 @@ class MultiAgentCustomerService:
         )
         priority_confirmer_node = builder.add_node(priority_confirmer, "priority_confirmer")
         
-        # 4. Route Agent - 路由决策 (纯PE，无工具)
+        # 4. Route Agent - 路由决策 (纯PE，无工具，无人工干预)
         route_agent = Agent(
             name="路由决策Agent",
             system_prompt="""你是一个智能路由决策专家。请分析用户查询和前面Agent的分析结果，判断是否需要人工干预。
 
-**分析规则：**
-- 高优先级服务（退款退货、投诉建议）→ 需要人工干预
-- 包含"经理"、"主管"、"人工客服"、"转人工" → 需要人工干预  
-- 包含"多次"、"一直"、"反复"、"没有解决"、"无法处理" → 需要人工干预
-- 一般咨询和简单问题 → 继续自动处理
+**重要：请检查状态中的selected_service_type和user_priority_level字段！**
+
+**分析规则（严格执行）：**
+1. 如果selected_service_type是"投诉建议"或"退款退货" → requires_human: true
+2. 如果user_priority_level是"high" → requires_human: true  
+3. 包含"经理"、"主管"、"人工客服"、"转人工" → requires_human: true
+4. 包含"多次"、"一直"、"反复"、"没有解决"、"无法处理" → requires_human: true
+5. 其他一般咨询和简单问题 → requires_human: false
 
 **输出格式（严格按照统一业务字段）：**
 ```json
@@ -334,6 +361,10 @@ class MultiAgentCustomerService:
   "status": "Success"
 }
 ```
+
+**示例：**
+- 如果selected_service_type="投诉建议" → requires_human: true
+- 如果selected_service_type="产品咨询" 且 user_priority_level="low" → requires_human: false
 
 请直接输出JSON，不要添加其他文字。"""
         )
@@ -453,47 +484,26 @@ class MultiAgentCustomerService:
             requires_user_input=True  # 需要用户输入
         )
         
-        # 用户交互边：priority_confirmer -> route_agent (需要用户确认优先级)
-        def has_priority_confirmation(state_manager: StateManager) -> bool:
-            """检查是否有用户的优先级确认"""
+        # 点击流程中的人工干预决策：priority_confirmer -> transfer_agent 或 answer_agent
+        def click_needs_human_intervention(state_manager: StateManager) -> bool:
+            """点击流程中检查是否需要人工干预"""
             user_input_data = state_manager.get_state("priority_confirmer_user_input")
-            if user_input_data:
-                user_confirmation = user_input_data.get("input")
-                print(f"     ✅ 发现优先级确认: {user_confirmation}")
+            if not user_input_data:
+                return False
                 
-                # 解析用户选择的优先级
-                if "高优先级" in user_confirmation or "确认" in user_confirmation:
-                    state_manager.global_state["user_priority_level"] = "high"
-                elif "中优先级" in user_confirmation:
-                    state_manager.global_state["user_priority_level"] = "medium"
-                elif "低优先级" in user_confirmation:
-                    state_manager.global_state["user_priority_level"] = "low"
-                
-                return True
-            print(f"     ❌ 未发现优先级确认")
-            return False
-        
-        builder.add_state_aware_edge(
-            priority_confirmer_node,
-            route_node,
-            has_priority_confirmation,
-            requires_user_input=True  # 需要用户输入
-        )
-        
-        # 路由决策边
-        def needs_human_intervention(state_manager: StateManager) -> bool:
-            """检查是否需要人工干预 - 考虑用户选择的优先级和服务类型"""
-            requires_human = state_manager.get_state("requires_human")
-            stage = state_manager.get_state("stage")
-            status = state_manager.get_state("status")
-            
-            # 检查用户选择的服务类型和优先级
+            user_confirmation = user_input_data.get("input")
             service_input = state_manager.get_state("service_selector_user_input")
-            priority_input = state_manager.get_state("priority_confirmer_user_input")
-            user_priority_level = state_manager.get_state("user_priority_level")
-            
             service_type = service_input.get("input", "") if service_input else ""
-            priority_choice = priority_input.get("input", "") if priority_input else ""
+            
+            # 解析用户选择的优先级
+            if "高优先级" in user_confirmation or "确认" in user_confirmation:
+                state_manager.global_state["user_priority_level"] = "high"
+            elif "中优先级" in user_confirmation:
+                state_manager.global_state["user_priority_level"] = "medium"
+            elif "低优先级" in user_confirmation:
+                state_manager.global_state["user_priority_level"] = "low"
+            
+            user_priority_level = state_manager.global_state.get("user_priority_level")
             
             # 高优先级服务类型
             high_priority_services = ["退款退货", "投诉建议"]
@@ -502,37 +512,29 @@ class MultiAgentCustomerService:
             needs_human = False
             
             # 1. 明确的高优先级选择
-            if user_priority_level == "high" or "高优先级" in priority_choice or "确认" in priority_choice:
+            if user_priority_level == "high" or "高优先级" in user_confirmation or "确认" in user_confirmation:
                 needs_human = True
                 
             # 2. 高优先级服务类型
             elif service_type in high_priority_services:
                 needs_human = True
-                
-            # 3. route_agent明确判断需要人工干预
-            elif requires_human == True:
-                needs_human = True
             
-            print(f"     🤔 人工干预检查: service_type={service_type}, priority_level={user_priority_level}, requires_human={requires_human}, stage={stage}, status={status}")
+            print(f"     🤔 点击流程人工干预检查: service_type={service_type}, priority_level={user_priority_level}")
             print(f"        决策结果: needs_human={needs_human}")
             
-            return (stage == "route_agent" and 
-                    status == "Success" and 
-                    needs_human)
+            return needs_human
         
-        def needs_auto_processing(state_manager: StateManager) -> bool:
-            """检查是否需要自动处理"""
-            requires_human = state_manager.get_state("requires_human")
-            stage = state_manager.get_state("stage")
-            status = state_manager.get_state("status")
-            
-            # 检查用户选择
+        def click_needs_auto_processing(state_manager: StateManager) -> bool:
+            """点击流程中检查是否需要自动处理"""
+            user_input_data = state_manager.get_state("priority_confirmer_user_input")
+            if not user_input_data:
+                return False
+                
+            user_confirmation = user_input_data.get("input")
             service_input = state_manager.get_state("service_selector_user_input")
-            priority_input = state_manager.get_state("priority_confirmer_user_input")
-            user_priority_level = state_manager.get_state("user_priority_level")
-            
             service_type = service_input.get("input", "") if service_input else ""
-            priority_choice = priority_input.get("input", "") if priority_input else ""
+            
+            user_priority_level = state_manager.global_state.get("user_priority_level")
             
             # 高优先级服务类型
             high_priority_services = ["退款退货", "投诉建议"]
@@ -541,25 +543,59 @@ class MultiAgentCustomerService:
             needs_auto = True
             
             # 1. 明确的高优先级选择 -> 不自动处理
-            if user_priority_level == "high" or "高优先级" in priority_choice or "确认" in priority_choice:
+            if user_priority_level == "high" or "高优先级" in user_confirmation or "确认" in user_confirmation:
                 needs_auto = False
                 
             # 2. 高优先级服务类型 -> 不自动处理
             elif service_type in high_priority_services:
                 needs_auto = False
-                
-            # 3. route_agent明确判断需要人工干预 -> 不自动处理
-            elif requires_human == True:
-                needs_auto = False
             
-            print(f"     🤖 自动处理检查: service_type={service_type}, priority_level={user_priority_level}, requires_human={requires_human}, stage={stage}, status={status}")
+            print(f"     🤖 点击流程自动处理检查: service_type={service_type}, priority_level={user_priority_level}")
             print(f"        决策结果: needs_auto={needs_auto}")
+            
+            return needs_auto
+        
+        # 点击流程的条件边（需要用户输入后才能判断）
+        builder.add_state_aware_edge(
+            priority_confirmer_node,
+            transfer_node,
+            click_needs_human_intervention,
+            requires_user_input=True  # 需要用户输入
+        )
+        
+        builder.add_state_aware_edge(
+            priority_confirmer_node,
+            answer_node,
+            click_needs_auto_processing,
+            requires_user_input=True  # 需要用户输入
+        )
+        
+        # 聊天流程的路由决策边（保持原有逻辑）
+        def needs_human_intervention(state_manager: StateManager) -> bool:
+            """聊天流程中检查是否需要人工干预"""
+            requires_human = state_manager.get_state("requires_human")
+            stage = state_manager.get_state("stage")
+            status = state_manager.get_state("status")
+            
+            print(f"     🤔 聊天流程人工干预检查: requires_human={requires_human}, stage={stage}, status={status}")
             
             return (stage == "route_agent" and 
                     status == "Success" and 
-                    needs_auto)
+                    requires_human == True)
         
-        # 使用真正的状态感知条件边
+        def needs_auto_processing(state_manager: StateManager) -> bool:
+            """聊天流程中检查是否需要自动处理"""
+            requires_human = state_manager.get_state("requires_human")
+            stage = state_manager.get_state("stage")
+            status = state_manager.get_state("status")
+            
+            print(f"     🤖 聊天流程自动处理检查: requires_human={requires_human}, stage={stage}, status={status}")
+            
+            return (stage == "route_agent" and 
+                    status == "Success" and 
+                    requires_human == False)
+        
+        # 聊天流程的条件边
         builder.add_state_aware_edge(route_node, transfer_node, needs_human_intervention)
         builder.add_state_aware_edge(route_node, intent_node, needs_auto_processing)
         builder.add_edge(intent_node, answer_node)
@@ -585,6 +621,81 @@ class MultiAgentCustomerService:
             print(f"❌ 执行失败: {str(e)}")
             raise
     
+    def execute_interactive(self, user_input: str):
+        """交互式执行多Agent工作流 - 在点击事件中等待用户终端输入"""
+        print("\n🚀 多Agent客户服务工作流开始执行（交互模式）")
+        print("="*60)
+        print(f"📥 用户输入: {user_input}")
+        
+        try:
+            # 执行图，捕获用户交互异常
+            result = self.graph(user_input)
+            return result
+            
+        except UserInteractionRequiredException as e:
+            # 处理用户交互请求
+            return self._handle_user_interaction(user_input, e.interaction_request)
+        except Exception as e:
+            print(f"❌ 执行失败: {str(e)}")
+            raise
+    
+    def _handle_user_interaction(self, original_input: str, interaction_request: Dict[str, Any]):
+        """处理用户交互请求 - 等待终端输入并继续执行"""
+        node_id = interaction_request.get("node_id")
+        original_output = interaction_request.get("original_output", {})
+        options = original_output.get("options", [])
+        message = original_output.get("message", "请选择一个选项：")
+        
+        print(f"\n🔔 {node_id} 需要用户输入:")
+        print(f"📝 {message}")
+        
+        if options:
+            print("📋 可选项:")
+            for i, option in enumerate(options, 1):
+                print(f"  {i}. {option}")
+        
+        # 等待用户终端输入
+        while True:
+            try:
+                user_choice = input("\n👤 请输入您的选择: ").strip()
+                
+                if not user_choice:
+                    print("❌ 输入不能为空，请重新输入")
+                    continue
+                
+                # 如果输入是数字，转换为对应的选项
+                if user_choice.isdigit() and options:
+                    choice_index = int(user_choice) - 1
+                    if 0 <= choice_index < len(options):
+                        user_choice = options[choice_index]
+                        print(f"✅ 您选择了: {user_choice}")
+                    else:
+                        print(f"❌ 无效选择，请输入 1-{len(options)} 之间的数字")
+                        continue
+                
+                # 提供用户输入
+                self.graph.provide_user_input(user_choice)
+                break
+                
+            except KeyboardInterrupt:
+                print("\n\n❌ 用户取消操作")
+                return None
+            except Exception as e:
+                print(f"❌ 输入处理错误: {e}")
+                continue
+        
+        # 继续执行，可能还有更多用户交互
+        try:
+            result = self.graph(original_input)
+            return result
+            
+        except UserInteractionRequiredException as e:
+            # 递归处理下一个用户交互
+            return self._handle_user_interaction(original_input, e.interaction_request)
+        except Exception as e:
+            print(f"❌ 继续执行失败: {str(e)}")
+            raise
+    
     def print_execution_summary(self, result):
         """打印执行摘要"""
         print(f"\n✅ 工作流执行完成:")
@@ -606,6 +717,65 @@ class MultiAgentCustomerService:
 
 # ==================== 主程序和测试 ====================
 
+def interactive_demo():
+    """交互式演示 - 等待用户终端输入"""
+    print("🎯 多Agent客户服务系统 - 交互式演示")
+    print("="*60)
+    print("💡 功能特点：")
+    print("  - 点击事件：需要用户选择服务类型和优先级")
+    print("  - 聊天事件：完全自动化处理")
+    print("  - 智能路由：根据用户选择决定人工干预或自动处理")
+    print("="*60)
+    
+    # 创建多Agent系统
+    customer_service = MultiAgentCustomerService()
+    
+    while True:
+        try:
+            print(f"\n{'='*60}")
+            print("🎤 请输入您的问题或需求（输入 'quit' 退出）:")
+            print("💡 提示：")
+            print("  - 短词如'投诉'、'退款'、'查询' → 点击流程（需要交互）")
+            print("  - 长句如'请问你们有什么活动推荐？' → 聊天流程（自动处理）")
+            print("-"*60)
+            
+            user_input = input("👤 您的输入: ").strip()
+            
+            if not user_input:
+                print("❌ 输入不能为空，请重新输入")
+                continue
+                
+            if user_input.lower() in ['quit', 'exit', '退出', 'q']:
+                print("\n👋 感谢使用多Agent客户服务系统，再见！")
+                break
+            
+            print(f"\n🔄 正在处理您的请求...")
+            
+            # 使用交互式执行
+            result = customer_service.execute_interactive(user_input)
+            
+            if result:
+                # 打印执行摘要
+                customer_service.print_execution_summary(result)
+            else:
+                print("❌ 执行被用户取消")
+                
+        except KeyboardInterrupt:
+            print("\n\n👋 用户中断，退出系统")
+            break
+        except Exception as e:
+            print(f"❌ 执行失败: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            
+            # 询问是否继续
+            try:
+                continue_choice = input("\n❓ 是否继续使用系统？(y/n): ").strip().lower()
+                if continue_choice not in ['y', 'yes', '是', '继续']:
+                    break
+            except KeyboardInterrupt:
+                break
+
 def main():
     """主程序"""
     print("🎯 多Agent客户服务系统演示 - 基于StatefulGraph的继承模式版本")
@@ -616,6 +786,30 @@ def main():
     print("  - StatefulGraph支持真正的状态感知条件路由和fallback机制")
     print("  - 实时状态处理：在节点执行时立即处理状态")
     print("  - 状态感知条件边：条件函数可以访问最新的Agent输出状态")
+    print("="*60)
+    
+    # 询问运行模式
+    print("\n🎮 请选择运行模式:")
+    print("  1. 交互式演示（推荐）- 等待用户终端输入")
+    print("  2. 自动测试 - 运行预设测试用例")
+    
+    try:
+        mode_choice = input("\n👤 请选择模式 (1/2): ").strip()
+        
+        if mode_choice == "1":
+            interactive_demo()
+        elif mode_choice == "2":
+            run_auto_tests()
+        else:
+            print("❌ 无效选择，默认运行交互式演示")
+            interactive_demo()
+            
+    except KeyboardInterrupt:
+        print("\n\n👋 用户中断，退出系统")
+
+def run_auto_tests():
+    """运行自动测试用例"""
+    print("\n🧪 运行自动测试用例")
     print("="*60)
     
     # 测试用例 - 简化版本
