@@ -26,6 +26,14 @@ from strands.multiagent.base import NodeResult, Status
 from strands.types.content import ContentBlock
 
 
+class UserInteractionRequiredException(Exception):
+    """用户交互需求异常 - 用于暂停Graph执行"""
+    
+    def __init__(self, interaction_request: Dict[str, Any]):
+        self.interaction_request = interaction_request
+        super().__init__(f"User interaction required for node: {interaction_request.get('node_id')}")
+
+
 #===================================
 #        Very Important： State Machine（Prompt中需要返回对应的状态字段，以便graph变迁）
 #===================================
@@ -174,6 +182,10 @@ class StatefulGraph(Graph):
         super().__init__(nodes, edges, entry_points)
         self.state_manager = state_manager or StateManager()
         
+        # 用户交互状态
+        self.interaction_mode = "auto"  # "auto" | "waiting_user"
+        self.pending_interaction = None
+        
         # 注册所有Agent到状态管理器
         for node_id, node in nodes.items():
             if hasattr(node.executor, 'state'):  # 确保是Agent
@@ -265,6 +277,209 @@ class StatefulGraph(Graph):
                 self.state_manager.global_state[key] = value
         
         self.state_manager._log_change(agent_id, "error_fallback", error_state)
+    
+    def _has_user_input_for_node(self, node_id: str) -> bool:
+        """检查节点是否已有用户输入"""
+        user_input_key = f"{node_id}_user_input"
+        return user_input_key in self.state_manager.global_state
+    
+    def _get_node_raw_output(self, node_id: str) -> Any:
+        """获取节点的原始输出"""
+        return self.state_manager.global_state.get(f"{node_id}_result", {})
+    
+    def _request_user_input(self, from_node):
+        """请求用户输入 - 发送原始Agent输出"""
+        
+        # 1. 获取节点的原始输出
+        node_result = self._get_node_raw_output(from_node.node_id)
+        
+        # 2. 构建交互请求（不依赖具体字段）
+        interaction_request = {
+            "node_id": from_node.node_id,
+            "node_name": getattr(from_node.executor, 'name', from_node.node_id),
+            "raw_output": node_result,  # 完整的Agent输出
+            "current_state": self.state_manager.get_state(),  # 当前完整状态
+            "timestamp": time.time()
+        }
+        
+        # 3. 设置等待状态
+        self.interaction_mode = "waiting_user"
+        self.pending_interaction = {
+            "node_id": from_node.node_id,
+            "original_output": node_result
+        }
+        
+        # 4. 输出给终端
+        self._output_to_terminal(interaction_request)
+        
+        # 5. 抛出异常暂停执行
+        raise UserInteractionRequiredException(interaction_request)
+    
+    def _output_to_terminal(self, interaction_request: Dict):
+        """输出交互请求到终端"""
+        print(f"\n🔔 用户交互请求:")
+        print(f"节点: {interaction_request['node_id']}")
+        print(f"原始输出: {json.dumps(interaction_request['raw_output'], ensure_ascii=False, indent=2)}")
+        
+        # 如果输出中包含选项，显示选项列表
+        raw_output = interaction_request['raw_output']
+        if isinstance(raw_output, dict) and 'options' in raw_output:
+            print(f"可选项: {raw_output['options']}")
+        
+        print(f"请提供用户输入...")
+        
+        # 在实际应用中，这里会通过API/WebSocket等方式发送给前端
+        # self.frontend_api.send_interaction_request(interaction_request)
+    
+    def provide_user_input(self, user_input: Any):
+        """接收用户输入并更新状态"""
+        
+        if self.interaction_mode != "waiting_user":
+            raise ValueError("Graph is not waiting for user input")
+        
+        node_id = self.pending_interaction["node_id"]
+        original_output = self.pending_interaction["original_output"]
+        
+        # 1. 保存用户输入到独立的状态键
+        self._store_user_input(node_id, user_input, original_output)
+        
+        # 2. 更新状态以包含用户输入信息
+        self._update_state_with_user_input(node_id, user_input)
+        
+        # 3. 恢复执行
+        self.interaction_mode = "auto"
+        self.pending_interaction = None
+        
+        # 4. 继续Graph执行
+        return self._continue_execution()
+    
+    def _store_user_input(self, node_id: str, user_input: Any, original_output: Dict):
+        """将用户输入存储到独立的状态键中，保持数据分离"""
+        
+        user_input_data = {
+            "input": user_input,
+            "timestamp": time.time(),
+            "node_id": node_id,
+            "original_output": original_output
+        }
+        
+        # 使用清晰的命名存储用户输入
+        user_input_key = f"{node_id}_user_input"
+        self.state_manager.global_state[user_input_key] = user_input_data
+        
+        # 记录用户交互
+        self.state_manager._log_change(node_id, "user_input_received", {
+            "user_input": user_input,
+            "stored_at": user_input_key
+        })
+    
+    def _update_state_with_user_input(self, node_id: str, user_input: Any):
+        """基于用户输入更新业务状态字段"""
+        
+        # 获取原始输出
+        original_output = self.state_manager.global_state.get(f"{node_id}_result", {})
+        
+        # 创建包含用户输入的增强状态
+        enhanced_state = original_output.copy() if isinstance(original_output, dict) else {}
+        
+        # 根据用户输入类型更新相关状态字段
+        if isinstance(user_input, dict):
+            # 如果用户输入是结构化数据，直接合并
+            enhanced_state.update(user_input)
+        else:
+            # 如果是简单输入，添加到特定字段
+            enhanced_state["user_selection"] = user_input
+        
+        # 标记包含用户交互
+        enhanced_state["has_user_interaction"] = True
+        enhanced_state["user_input_timestamp"] = time.time()
+        
+        # 重新提取状态（基于增强后的数据）
+        self.state_manager.extract_state_from_agent_output(node_id, json.dumps(enhanced_state))
+        
+        # 额外处理：直接更新全局状态中的用户输入字段
+        if isinstance(user_input, dict):
+            for key, value in user_input.items():
+                self.state_manager.global_state[key] = value
+        else:
+            self.state_manager.global_state["user_selection"] = user_input
+        
+        # 标记用户交互
+        self.state_manager.global_state["has_user_interaction"] = True
+        self.state_manager.global_state["user_input_timestamp"] = enhanced_state["user_input_timestamp"]
+        
+        # 记录状态更新
+        self.state_manager._log_change(node_id, "state_updated_with_user_input", {
+            "enhanced_state": enhanced_state,
+            "direct_updates": user_input if isinstance(user_input, dict) else {"user_selection": user_input}
+        })
+    
+    def _continue_execution(self):
+        """继续Graph执行 - 真实实现"""
+        try:
+            # 1. 重新检查所有节点的就绪状态
+            # 由于用户输入已经合并到状态中，之前被阻塞的边现在可能可以执行了
+            
+            # 2. 找到所有可以执行的节点
+            ready_nodes = []
+            for node_id, node in self.nodes.items():
+                if node.execution_status == Status.PENDING:
+                    # 检查节点的所有依赖是否满足
+                    if self._is_node_ready_to_execute(node):
+                        ready_nodes.append(node)
+            
+            # 3. 如果有就绪的节点，创建一个新的执行任务
+            if ready_nodes:
+                print(f"🔄 继续执行，发现 {len(ready_nodes)} 个就绪节点")
+                
+                # 由于Graph的异步执行机制复杂，这里采用简化的方式
+                # 实际应用中，前端应该重新调用graph()来完整执行
+                return {
+                    "status": "ready_to_continue",
+                    "ready_nodes": [node.node_id for node in ready_nodes],
+                    "interaction_mode": self.interaction_mode,
+                    "message": f"用户输入已处理，发现 {len(ready_nodes)} 个就绪节点，请重新调用graph()继续执行"
+                }
+            else:
+                # 没有更多可执行的节点，执行完成
+                return {
+                    "status": "execution_completed",
+                    "interaction_mode": self.interaction_mode,
+                    "message": "用户输入已处理，Graph执行完成"
+                }
+                
+        except Exception as e:
+            print(f"❌ 继续执行失败: {str(e)}")
+            return {
+                "status": "continue_execution_failed",
+                "error": str(e),
+                "interaction_mode": self.interaction_mode,
+                "message": "继续执行时发生错误"
+            }
+    
+    def _is_node_ready_to_execute(self, node: GraphNode) -> bool:
+        """检查节点是否准备好执行"""
+        try:
+            # 检查节点的所有依赖边是否满足条件
+            for edge in self.edges:
+                if edge.to_node == node:
+                    # 检查源节点是否已完成
+                    if edge.from_node.execution_status != Status.COMPLETED:
+                        continue
+                    
+                    # 检查边的条件是否满足
+                    if edge.condition and not edge.condition(self.state):
+                        continue
+                    
+                    # 如果有任何一条边满足条件，节点就可以执行
+                    return True
+            
+            # 如果是入口节点（没有依赖），也可以执行
+            return node in self.entry_points
+            
+        except Exception as e:
+            print(f"⚠️ 检查节点就绪状态失败 ({node.node_id}): {str(e)}")
+            return False
 
 
 class StatefulGraphBuilder(GraphBuilder):
@@ -297,37 +512,58 @@ class StatefulGraphBuilder(GraphBuilder):
             state_manager=self.state_manager
         )
         
+        # 将graph实例保存到state_manager的内部属性中（不会被序列化）
+        self.state_manager._graph_instance = stateful_graph
+        
         return stateful_graph
     
-    def add_state_aware_edge(self, from_node, to_node, condition_func: Callable[[StateManager], bool]):
-        """添加基于状态的条件边 - 真正的状态感知实现
+    def add_state_aware_edge(self, from_node, to_node, 
+                           condition_func: Callable[[StateManager], bool],
+                           requires_user_input: bool = False):
+        """添加基于状态的条件边 - 支持用户交互的通用实现
         
         ✅ 优势：由于继承模式的实时状态处理，条件函数可以访问最新的状态
         
         Args:
             from_node: 源节点
             to_node: 目标节点
-            condition_func: 条件函数，接收StateManager作为参数，可以访问最新状态
+            condition_func: 条件函数，接收StateManager作为参数，可以访问最新状态（包括用户输入）
+            requires_user_input: 是否需要用户输入才能执行这条边
         """
-        def state_aware_condition(graph_state: GraphState) -> bool:
-            """包装条件函数，注入state_manager访问能力"""
+        def enhanced_state_aware_condition(graph_state: GraphState) -> bool:
+            """支持用户交互的增强条件函数"""
             try:
-                # 通过闭包捕获state_manager引用，提供真正的状态访问
+                # 1. 检查是否需要用户输入
+                if requires_user_input:
+                    # 从state_manager的内部属性获取graph实例
+                    graph_instance = getattr(self.state_manager, '_graph_instance', None)
+                    
+                    if graph_instance and not graph_instance._has_user_input_for_node(from_node.node_id):
+                        # 需要用户输入但还没有输入 - 请求用户输入
+                        graph_instance._request_user_input(from_node)
+                        return False  # 暂停执行这条边
+                
+                # 2. 执行正常的条件检查（现在可以访问用户输入）
                 result = condition_func(self.state_manager)
                 print(f"   🔍 状态感知条件检查: {from_node.node_id} -> {to_node.node_id} = {result}")
                 
                 # 显示当前状态信息
                 current_state = self.state_manager.get_state()
-                key_states = {k: v for k, v in current_state.items() if not k.endswith('_result')}
+                key_states = {k: v for k, v in current_state.items() 
+                             if not k.endswith('_result') and not k.startswith('_')}
                 if key_states:
                     print(f"       当前状态: {json.dumps(key_states, ensure_ascii=False)}")
                 
                 return result
+                
+            except UserInteractionRequiredException:
+                # 用户交互异常，重新抛出
+                raise
             except Exception as e:
                 print(f"   ⚠️  状态感知条件检查失败: {str(e)}")
                 return False
         
-        return self.add_edge(from_node, to_node, state_aware_condition)
+        return self.add_edge(from_node, to_node, enhanced_state_aware_condition)
     
     def add_node_with_state(self, executor: Agent, node_id: str = None) -> 'GraphNode':
         """添加节点并自动注册到状态管理器"""

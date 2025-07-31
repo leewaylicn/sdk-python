@@ -308,29 +308,56 @@ class UtilityAgent(Agent):
         )
     
     def __call__(self, prompt, **kwargs):
-        """重写调用方法，添加工具结果提取"""
+        """重写调用方法，统一输出格式"""
         result = super().__call__(prompt, **kwargs)
         
-        # 增强结果，添加工具执行信息
-        return self._enhance_result(result)
+        # 统一输出格式，将工具结果嵌入到消息内容中
+        return self._unify_output_format(result)
     
     async def invoke_async(self, prompt, **kwargs):
         """异步调用方法"""
         result = await super().invoke_async(prompt, **kwargs)
-        return self._enhance_result(result)
+        return self._unify_output_format(result)
     
-    def _enhance_result(self, result):
-        """增强结果，提取工具执行信息"""
+    def _unify_output_format(self, result):
+        """统一输出格式，使UtilityAgent的输出与标准Agent一致"""
         # 提取工具调用结果
-        tool_results = self._extract_tool_results()
+        tool_result_text = self.last_tool_result
         
-        # 添加到结果中
+        if tool_result_text and hasattr(result, 'message'):
+            # 修改消息内容，将工具结果作为主要内容
+            if hasattr(result.message, 'content') and result.message.content:
+                # 更新第一个content block的text为工具结果
+                if isinstance(result.message.content, list) and len(result.message.content) > 0:
+                    if isinstance(result.message.content[0], dict) and 'text' in result.message.content[0]:
+                        result.message.content[0]['text'] = tool_result_text
+                    else:
+                        # 如果格式不符合预期，创建新的content结构
+                        result.message.content = [{'text': tool_result_text}]
+                else:
+                    # 如果没有content，创建新的
+                    result.message.content = [{'text': tool_result_text}]
+            elif isinstance(result.message, dict):
+                # 处理字典格式的message
+                if 'content' in result.message:
+                    if isinstance(result.message['content'], list) and len(result.message['content']) > 0:
+                        if isinstance(result.message['content'][0], dict):
+                            result.message['content'][0]['text'] = tool_result_text
+                        else:
+                            result.message['content'] = [{'text': tool_result_text}]
+                    else:
+                        result.message['content'] = [{'text': tool_result_text}]
+                else:
+                    result.message['content'] = [{'text': tool_result_text}]
+        
+        # 保留原有的增强信息
         if hasattr(result, '__dict__'):
-            result.tool_results = tool_results
+            result.tool_results = self._extract_tool_results()
             result.utility_agent_info = {
                 'preferred_tool': self.preferred_tool,
                 'auto_terminate': self.auto_terminate,
-                'response_text': self.response_text
+                'response_text': self.response_text,
+                'unified_output': True
             }
         
         return result

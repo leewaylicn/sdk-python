@@ -112,6 +112,110 @@ def analyze_event_type(user_input: str) -> str:
 
 
 @tool
+def detect_service_type(user_input: str) -> str:
+    """检测用户查询的服务类型，并提供选项供用户选择"""
+    
+    # 分析用户输入，提取可能的服务类型
+    service_keywords = {
+        "订单查询": ["订单", "查询", "状态", "物流", "配送", "order"],
+        "退款退货": ["退款", "退货", "返回", "refund", "return"],
+        "产品咨询": ["产品", "功能", "规格", "价格", "咨询", "product"],
+        "技术支持": ["技术", "故障", "问题", "bug", "support", "technical"],
+        "投诉建议": ["投诉", "建议", "意见", "complaint", "feedback"],
+        "账户问题": ["账户", "登录", "密码", "个人信息", "account", "login"]
+    }
+    
+    # 计算每个服务类型的匹配分数
+    scores = {}
+    for service_type, keywords in service_keywords.items():
+        score = sum(1 for keyword in keywords if keyword in user_input.lower())
+        if score > 0:
+            scores[service_type] = score
+    
+    # 根据匹配情况生成选项
+    if scores:
+        # 按分数排序，取前3个
+        sorted_services = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:3]
+        recommended_services = [service for service, _ in sorted_services]
+        
+        # 添加其他选项
+        all_services = list(service_keywords.keys())
+        other_services = [s for s in all_services if s not in recommended_services]
+        options = recommended_services + other_services[:3]
+    else:
+        # 如果没有明确匹配，提供所有选项
+        options = list(service_keywords.keys())
+    
+    result = {
+        "message": "请选择您需要的服务类型，以便我们为您提供更精准的帮助：",
+        "options": options,
+        "detected_keywords": list(scores.keys()) if scores else [],
+        "requires_user_selection": True,
+        "stage": "service_selector",
+        "status": "Success"
+    }
+    
+    return json.dumps(result, ensure_ascii=False)
+
+
+@tool
+def determine_priority(user_input: str = "") -> str:
+    """根据服务类型和用户输入确定优先级，需要用户确认"""
+    
+    # 从全局状态获取服务类型（这个会在条件函数中设置）
+    # 这里使用默认值，实际会通过Agent的state获取
+    service_type = "技术支持"  # 默认值
+    
+    # 高优先级关键词
+    high_priority_keywords = [
+        "紧急", "急", "马上", "立即", "重要", "严重",
+        "urgent", "emergency", "asap", "critical"
+    ]
+    
+    # 根据服务类型预设优先级
+    service_priority_map = {
+        "退款退货": "high",
+        "投诉建议": "high", 
+        "技术支持": "medium",
+        "订单查询": "medium",
+        "产品咨询": "low",
+        "账户问题": "medium"
+    }
+    
+    # 检查用户输入中的紧急关键词
+    has_urgent_keywords = any(keyword in user_input.lower() for keyword in high_priority_keywords)
+    
+    # 确定建议的优先级
+    suggested_priority = service_priority_map.get(service_type, "medium")
+    if has_urgent_keywords:
+        suggested_priority = "high"
+    
+    # 优先级描述
+    priority_descriptions = {
+        "high": "高优先级 - 将优先处理，预计2-5分钟内响应",
+        "medium": "中优先级 - 正常处理，预计10-15分钟内响应", 
+        "low": "低优先级 - 按顺序处理，预计30分钟内响应"
+    }
+    
+    result = {
+        "message": f"根据您选择的服务类型「{service_type}」，我们建议设置为{priority_descriptions[suggested_priority]}。请确认或选择其他优先级：",
+        "suggested_priority": suggested_priority,
+        "options": [
+            f"确认 - {priority_descriptions[suggested_priority]}",
+            f"高优先级 - {priority_descriptions['high']}", 
+            f"中优先级 - {priority_descriptions['medium']}",
+            f"低优先级 - {priority_descriptions['low']}"
+        ],
+        "service_type": service_type,
+        "requires_user_confirmation": True,
+        "stage": "priority_confirmer",
+        "status": "Success"
+    }
+    
+    return json.dumps(result, ensure_ascii=False)
+
+
+@tool
 def generate_transfer_message(user_query: str) -> str:
     """生成人工转接消息"""
     
@@ -157,7 +261,7 @@ class MultiAgentCustomerService:
         self.graph = self._create_graph()
     
     def _create_graph(self):
-        """创建多Agent图"""
+        """创建多Agent图 - 包含用户交互的UtilityAgent"""
         
         # 创建StatefulGraphBuilder
         builder = StatefulGraphBuilder()
@@ -171,21 +275,53 @@ class MultiAgentCustomerService:
         )
         entry_node = builder.add_node(entry_agent, "entry_agent")
         
-        # 2. Route Agent - 路由决策 (纯PE，无工具)
+        # 2. Service Selector UtilityAgent - 服务类型选择 (需要用户交互)
+        service_selector = create_utility_agent(
+            tools=[detect_service_type],
+            name="服务类型选择Agent",
+            preferred_tool="detect_service_type",
+            response_text="正在分析您的需求，为您提供服务类型选项..."
+        )
+        service_selector_node = builder.add_node(service_selector, "service_selector")
+        
+        # 3. Priority Confirmer UtilityAgent - 优先级确认 (需要用户交互)
+        # 创建一个特殊的Agent，能够访问状态中的服务类型
+        priority_confirmer = Agent(
+            name="优先级确认Agent",
+            system_prompt="""你是一个优先级确认专家。请根据用户选择的服务类型确定优先级，并提供选项供用户确认。
+
+**任务：**
+1. 从状态中获取用户选择的服务类型
+2. 根据服务类型建议优先级
+3. 提供选项供用户确认
+
+**输出格式：**
+```json
+{
+  "message": "根据您选择的服务类型，我们建议设置优先级。请确认或选择其他优先级：",
+  "suggested_priority": "high/medium/low",
+  "options": ["确认 - 高优先级", "高优先级", "中优先级", "低优先级"],
+  "service_type": "用户选择的服务类型",
+  "requires_user_confirmation": true,
+  "stage": "priority_confirmer",
+  "status": "Success"
+}
+```
+
+请直接输出JSON，不要添加其他文字。"""
+        )
+        priority_confirmer_node = builder.add_node(priority_confirmer, "priority_confirmer")
+        
+        # 4. Route Agent - 路由决策 (纯PE，无工具)
         route_agent = Agent(
             name="路由决策Agent",
-            system_prompt="""你是一个智能路由决策专家。请分析用户查询，判断是否需要人工干预，并识别主题类型和联系原因。
+            system_prompt="""你是一个智能路由决策专家。请分析用户查询和前面Agent的分析结果，判断是否需要人工干预。
 
 **分析规则：**
-- 包含"退款"、"投诉"、"不满意"、"差评"、"问题严重" → 需要人工干预
+- 高优先级服务（退款退货、投诉建议）→ 需要人工干预
 - 包含"经理"、"主管"、"人工客服"、"转人工" → 需要人工干预  
 - 包含"多次"、"一直"、"反复"、"没有解决"、"无法处理" → 需要人工干预
 - 一般咨询和简单问题 → 继续自动处理
-
-**主题类型识别：**
-- booking: 预订、订单相关
-- activity: 活动、景点、娱乐相关
-- other: 其他类型
 
 **输出格式（严格按照统一业务字段）：**
 ```json
@@ -203,7 +339,7 @@ class MultiAgentCustomerService:
         )
         route_node = builder.add_node(route_agent, "route_agent")
         
-        # 3. Intent Agent - 意图分析 (纯PE，无工具)
+        # 5. Intent Agent - 意图分析 (纯PE，无工具)
         intent_agent = Agent(
             name="意图分析Agent",
             system_prompt="""你是一个用户意图分析专家。请深入分析用户查询，提取关键业务信息和实体。
@@ -231,7 +367,7 @@ class MultiAgentCustomerService:
         )
         intent_node = builder.add_node(intent_agent, "intent_agent")
         
-        # 4. Transfer UtilityAgent - 人工转接 (使用工具)
+        # 6. Transfer UtilityAgent - 人工转接 (使用工具)
         transfer_agent = create_utility_agent(
             tools=[generate_transfer_message],
             name="人工转接Agent",
@@ -240,7 +376,7 @@ class MultiAgentCustomerService:
         )
         transfer_node = builder.add_node(transfer_agent, "transfer_agent")
         
-        # 5. Answer Agent - 最终回答 (纯PE，无工具)
+        # 7. Answer Agent - 最终回答 (纯PE，无工具)
         answer_agent = Agent(
             name="最终回答Agent",
             system_prompt="""你是一个专业的客服回答生成专家。请基于用户查询和前面Agent的分析结果生成最终回答。
@@ -260,35 +396,168 @@ class MultiAgentCustomerService:
         )
         answer_node = builder.add_node(answer_agent, "answer_agent")
         
-        # 添加边和条件路由
-        builder.add_edge(entry_node, route_node)
+        # ==================== 添加边和条件路由 ====================
         
-        # 真正的状态感知条件路由 - 使用继承模式的优势
+        # 主流程分支：根据事件类型决定路径
+        def is_click_event(state_manager: StateManager) -> bool:
+            """检查是否为点击事件 - 需要用户交互流程"""
+            event_type = state_manager.get_state("event_type")
+            stage = state_manager.get_state("stage")
+            status = state_manager.get_state("status")
+            
+            print(f"     🖱️  点击事件检查: event_type={event_type}, stage={stage}, status={status}")
+            
+            # 点击事件需要通过服务选择和优先级确认流程
+            return (stage == "entry_agent" and 
+                    status == "Success" and 
+                    event_type == "click")
+        
+        def is_chat_event(state_manager: StateManager) -> bool:
+            """检查是否为自由文本事件 - 直接进入路由决策"""
+            event_type = state_manager.get_state("event_type")
+            stage = state_manager.get_state("stage")
+            status = state_manager.get_state("status")
+            
+            print(f"     💬 自由文本检查: event_type={event_type}, stage={stage}, status={status}")
+            
+            # 自由文本直接进入路由决策，跳过用户交互
+            return (stage == "entry_agent" and 
+                    status == "Success" and 
+                    event_type == "chat")
+        
+        # 条件分支：点击事件 -> 服务选择流程
+        builder.add_state_aware_edge(entry_node, service_selector_node, is_click_event)
+        
+        # 条件分支：自由文本 -> 直接路由决策
+        builder.add_state_aware_edge(entry_node, route_node, is_chat_event)
+        
+        # 用户交互边：service_selector -> priority_confirmer (需要用户选择服务类型)
+        def has_service_selection(state_manager: StateManager) -> bool:
+            """检查是否有用户的服务类型选择"""
+            user_input_data = state_manager.get_state("service_selector_user_input")
+            if user_input_data:
+                user_selection = user_input_data.get("input")
+                print(f"     ✅ 发现服务类型选择: {user_selection}")
+                
+                # 将用户选择的服务类型传递给priority_confirmer工具
+                # 通过更新全局状态来传递参数
+                state_manager.global_state["selected_service_type"] = user_selection
+                return True
+            print(f"     ❌ 未发现服务类型选择")
+            return False
+        
+        builder.add_state_aware_edge(
+            service_selector_node, 
+            priority_confirmer_node, 
+            has_service_selection,
+            requires_user_input=True  # 需要用户输入
+        )
+        
+        # 用户交互边：priority_confirmer -> route_agent (需要用户确认优先级)
+        def has_priority_confirmation(state_manager: StateManager) -> bool:
+            """检查是否有用户的优先级确认"""
+            user_input_data = state_manager.get_state("priority_confirmer_user_input")
+            if user_input_data:
+                user_confirmation = user_input_data.get("input")
+                print(f"     ✅ 发现优先级确认: {user_confirmation}")
+                
+                # 解析用户选择的优先级
+                if "高优先级" in user_confirmation or "确认" in user_confirmation:
+                    state_manager.global_state["user_priority_level"] = "high"
+                elif "中优先级" in user_confirmation:
+                    state_manager.global_state["user_priority_level"] = "medium"
+                elif "低优先级" in user_confirmation:
+                    state_manager.global_state["user_priority_level"] = "low"
+                
+                return True
+            print(f"     ❌ 未发现优先级确认")
+            return False
+        
+        builder.add_state_aware_edge(
+            priority_confirmer_node,
+            route_node,
+            has_priority_confirmation,
+            requires_user_input=True  # 需要用户输入
+        )
+        
+        # 路由决策边
         def needs_human_intervention(state_manager: StateManager) -> bool:
-            """检查是否需要人工干预 - 真正的状态感知版本"""
+            """检查是否需要人工干预 - 考虑用户选择的优先级和服务类型"""
             requires_human = state_manager.get_state("requires_human")
             stage = state_manager.get_state("stage")
             status = state_manager.get_state("status")
             
-            print(f"     🤔 人工干预检查: requires_human={requires_human}, stage={stage}, status={status}")
+            # 检查用户选择的服务类型和优先级
+            service_input = state_manager.get_state("service_selector_user_input")
+            priority_input = state_manager.get_state("priority_confirmer_user_input")
+            user_priority_level = state_manager.get_state("user_priority_level")
             
-            # 只有当route_agent成功执行且明确需要人工干预时才转接
+            service_type = service_input.get("input", "") if service_input else ""
+            priority_choice = priority_input.get("input", "") if priority_input else ""
+            
+            # 高优先级服务类型
+            high_priority_services = ["退款退货", "投诉建议"]
+            
+            # 判断是否需要人工干预
+            needs_human = False
+            
+            # 1. 明确的高优先级选择
+            if user_priority_level == "high" or "高优先级" in priority_choice or "确认" in priority_choice:
+                needs_human = True
+                
+            # 2. 高优先级服务类型
+            elif service_type in high_priority_services:
+                needs_human = True
+                
+            # 3. route_agent明确判断需要人工干预
+            elif requires_human == True:
+                needs_human = True
+            
+            print(f"     🤔 人工干预检查: service_type={service_type}, priority_level={user_priority_level}, requires_human={requires_human}, stage={stage}, status={status}")
+            print(f"        决策结果: needs_human={needs_human}")
+            
             return (stage == "route_agent" and 
                     status == "Success" and 
-                    requires_human == True)
+                    needs_human)
         
         def needs_auto_processing(state_manager: StateManager) -> bool:
-            """检查是否需要自动处理 - 真正的状态感知版本"""
+            """检查是否需要自动处理"""
             requires_human = state_manager.get_state("requires_human")
             stage = state_manager.get_state("stage")
             status = state_manager.get_state("status")
             
-            print(f"     🤖 自动处理检查: requires_human={requires_human}, stage={stage}, status={status}")
+            # 检查用户选择
+            service_input = state_manager.get_state("service_selector_user_input")
+            priority_input = state_manager.get_state("priority_confirmer_user_input")
+            user_priority_level = state_manager.get_state("user_priority_level")
             
-            # 只有当route_agent成功执行且不需要人工干预时才自动处理
+            service_type = service_input.get("input", "") if service_input else ""
+            priority_choice = priority_input.get("input", "") if priority_input else ""
+            
+            # 高优先级服务类型
+            high_priority_services = ["退款退货", "投诉建议"]
+            
+            # 判断是否自动处理（与人工干预相反的逻辑）
+            needs_auto = True
+            
+            # 1. 明确的高优先级选择 -> 不自动处理
+            if user_priority_level == "high" or "高优先级" in priority_choice or "确认" in priority_choice:
+                needs_auto = False
+                
+            # 2. 高优先级服务类型 -> 不自动处理
+            elif service_type in high_priority_services:
+                needs_auto = False
+                
+            # 3. route_agent明确判断需要人工干预 -> 不自动处理
+            elif requires_human == True:
+                needs_auto = False
+            
+            print(f"     🤖 自动处理检查: service_type={service_type}, priority_level={user_priority_level}, requires_human={requires_human}, stage={stage}, status={status}")
+            print(f"        决策结果: needs_auto={needs_auto}")
+            
             return (stage == "route_agent" and 
                     status == "Success" and 
-                    requires_human == False)
+                    needs_auto)
         
         # 使用真正的状态感知条件边
         builder.add_state_aware_edge(route_node, transfer_node, needs_human_intervention)
