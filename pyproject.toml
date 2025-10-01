@@ -80,7 +80,7 @@ ollama = [
     "ollama>=0.4.8,<1.0.0",
 ]
 openai = [
-    "openai>=1.68.0,<2.0.0",
+    "openai>=1.68.0,<3.0.0",
 ]
 otel = [
     "opentelemetry-exporter-otlp-proto-http>=1.30.0,<2.0.0",
@@ -130,7 +130,7 @@ all = [
     "ollama>=0.4.8,<1.0.0",
 
     # openai
-    "openai>=1.68.0,<2.0.0",
+    "openai>=1.68.0,<3.0.0",
 
     # otel
     "opentelemetry-exporter-otlp-proto-http>=1.30.0,<2.0.0",
